@@ -1,0 +1,670 @@
+---
+title: "HR Employee Attrition Analysis and Predictions"
+author: "Rhys Tutt"
+date: "18 December 2017"
+output: html_document
+---
+
+## Background
+
+The is a fictional dataset published on Kaggle by IBM data scientists detailing employee features and their attrition.
+
+https://www.kaggle.com/pavansubhasht/ibm-hr-analytics-attrition-dataset
+
+The purpose of my analysis is to uncover trends and factors driving those who do choose to leave the company. That way we can understand who's leaving, the correlation between them and then make predictions ahead of time so we can strategise to retain them.
+
+Although this dataset is artificial and thus lacks a few of the usual nuiances, this mirrors similar projects I've created in my professional career based around customer attrition.
+
+Also for clarity, while I've retained most of the code, I have removed some redundant sections performing manipulation and creating plots.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+For this analysis I'll be using a few of my "Go-To" packages I use daily to perform various functions.
+
+Manipulation and visualization: TidyQuant (loads dplyr, ggplot2, tidyr, lubridate, etc), ggthemes, gridExtra.
+
+Analysis: corrr, corrplot, lime.
+
+Pre-processing & modelling: recipes, DMwR, caret, party, h2o, xgboost, rattle, ROCR.
+
+Then I load and take a look at the dataset.
+
+```{r packages, include = FALSE, message = FALSE}
+library(tidyquant)
+library(ggthemes)
+library(gridExtra)
+library(corrplot)
+library(corrr)
+library(recipes)
+library(DMwR)
+library(caret)
+library(party)
+library(h2o)
+library(xgboost)
+library(rattle)
+library(ROCR)
+library(lime)
+```
+
+```{r WD, echo = FALSE}
+setwd ("T:\\Risk Management\\Rhys\\IMPORTANT\\Business Insights\\Genuine New User Retention\\3.0 - 30 Days\\Cleaned Up")
+```
+
+```{r }
+set.seed(123)
+dataset <- read.csv("IBM dataset.csv")
+glimpse(dataset)
+```
+
+## Initial Exploration and Clean-Up
+
+Firstly, I take a look at the target variable and the relative frequencies of the outcome we are predicting. We can see only 16% are leaving, so obviously there is a fairly big imbalance here, so any modelling will most likely benefit from applying a statistical tecnique to treat this, e.g. SMOTE.
+
+Also worth noting that it will be much easier to predict the "No" outcome here and we will be more concerned with predicting those that do leave (Precision and Recall) but we'll dive into this more at a later stage.
+
+```{r outcomefreq}
+dataset %>% 
+  group_by(Attrition) %>% 
+  summarise(Number = n()) %>% 
+  mutate(Freq = Number / sum(Number) )
+```
+
+Then we'll look for any missing values (in this case there are none) and we'll remove some redundant variables that either have no bearing on the outcome or are all the same value. Once the first stage of this clean-up is complete I like to re-order the features by their data type to make it easier for analysis and put the target feature first.
+
+```{r clean1}
+dataset[!complete.cases(dataset),]
+summary(dataset$Over18)
+dataset$Over18 <- NULL
+dataset$EmployeeCount <- NULL
+dataset$StandardHours <- NULL
+
+dataset <- dataset %>% 
+  select(EmployeeNumber, Attrition, BusinessTravel, Department, Education, EducationField, EnvironmentSatisfaction, Gender, JobInvolvement, JobRole:MaritalStatus, OverTime, PerformanceRating, RelationshipSatisfaction, WorkLifeBalance, Age, DailyRate, DistanceFromHome, HourlyRate, JobLevel, MonthlyIncome:NumCompaniesWorked, PercentSalaryHike, StockOptionLevel:TrainingTimesLastYear, YearsAtCompany:YearsWithCurrManager)
+
+dataset <- dataset %>% 
+  select(EmployeeNumber:Age, JobLevel, NumCompaniesWorked, StockOptionLevel:YearsWithCurrManager, DailyRate:HourlyRate, MonthlyIncome, MonthlyRate, PercentSalaryHike )
+```
+
+## Splitting Data
+
+We need to split the data into various sets before doing any further analysis or modelling. This dataset is fairly small so ordinarily I would just split it into a training and testing set, but I wish to use the auto_ml feature in the H2O package which requires a validation set to assist in training the model, so I'll split it into 3 parts.
+
+Using a Caret function I'll split the original dataset with 70% training, 15% validating and 15% in a testing set which we won't touch until once at the end when we're happy with the model.
+
+```{r splitting}
+inTrain <- createDataPartition(y = dataset$Attrition,
+                               p = 0.7, list = FALSE)
+
+training <- dataset[inTrain,]
+testval <- dataset[-inTrain,]
+
+inTest <- createDataPartition(y = testval$Attrition,
+                              p = 0.5, list = FALSE)
+
+validating <- testval[-inTest,]
+testing <- testval[inTest,]
+
+dim(training)
+dim(validating)
+dim(testing)
+```
+
+```{r aside, echo = FALSE}
+training2 <- training
+validating2 <- validating
+testing2 <- testing
+
+training <- training[,-1]
+validating <- validating[,-1]
+testing <- testing[,-1]
+```
+
+## Tree Induction
+
+Before doing too much exploration or subsequent feature pre-processing/engineering I like to visualize the most important features using a tree model. This just gives us an idea of some of the more important driving factors.
+
+I'll use a conditional inference tree as I like the visualizations.
+
+So it looks like whether an employee has taken OverTime, their JobRole, Marital Status, Age and YearsWithCurrManager all play a big part in attrition. 
+
+For example, you can also see by the plot that in the majority of cases we can already predict the outcome with over 70-80% certainty, but there are some cases where the probability of attrition outcome goes down to around 40-60% and we would hope to improve on this and find other features that further split these to make more accurate predictions.
+
+Another interesting insight is we can already see a tendency of younger and single staff to be more likely to leave.
+
+```{r ctree}
+ct <- ctree(Attrition ~ ., data = training)
+plot(ct, main = "Conditional Inference Tree")
+```
+
+## Recursive Feature Elimination in Caret
+
+Again there are over 30 variables here and although we know a few of the more important ones, we want to understand which other features are most important rather than painstakingly checking through each one. Although depending on the size and scope of the project this could also be done.
+
+We can see the most accurate model has 18 variables and we get the list of importance. In the modelling stage, we could also remove some of the variables not shown below as they are redundant and just adding noise.
+
+```{r rfe}
+control <- rfeControl(functions = rfFuncs, method = "cv", number = 10)
+rfeResults <- rfe(training[,-1], training[,1], size = c(1:31), rfeControl = control)
+
+predictors(rfeResults)
+plot(rfeResults, type=c("g", "o"))
+```
+
+## Correlation Between Features
+
+A correlation plot helps us understand which numeric features are related and highly correlated to each other, such as MonthlyIncome & JobLevel or YearsAtCompany & YearsWithCurrManager. 
+
+This is not the best, so we could perform PCA on highly correlated variables, but for now we will leave this.
+
+```{r corrplot}
+varCorr <- training %>% select(Age:PercentSalaryHike)
+M <- cor(varCorr)
+diag(M) <- 0
+
+corrplot(M, method = "square")
+
+which(M > 0.8,arr.ind=T)
+```
+
+## Further Exploratory Analysis
+
+I often spend a lot of time understanding the various features and their correlation with the outcome, but will just a show of the visualizations that will assist us here.
+
+Sometimes I use Tableau style colours, but after recently reading Storytelling with Data, I'm now preferring to use tones of grey with specific use of colour to direct the viewers attention and get my point across.
+
+Firstly I'll use violin and box plots as these are a good way to visualize distribution and compare a continuous/factor variable.
+
+```{r ageviolin, echo = FALSE}
+ggplot(data = training, aes(x = Attrition, y = Age)) +
+  geom_violin(aes(fill = Attrition), alpha = 0.9) +
+  geom_boxplot(width = 0.3, fill = "white", alpha = 0.5) +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_fill_manual(values = c("azure4", "firebrick")) +
+  guides(fill = FALSE) +
+  labs(title = 'Younger Employees More Likely To Leave',
+       subtitle = 'Especially those in their early 30s or younger.',
+       caption = 'Could discretize this variable to make it easier for the model to distinguish between these age groups.')
+```
+
+```{r overtimeviolin, echo = FALSE}
+ggplot(data = training, aes(x = OverTime, fill = Attrition)) +
+  geom_bar(stat = "count", colour = "black") +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_fill_manual(values = c("azure3", "firebrick")) +
+  labs(title = 'Those who take Over Time more likely to leave')
+```
+
+### Job Roles
+
+I'm going to spend a bit of time here, as there looks to be a big gap in attrition between the different roles.
+
+Firstly, we can have a look at a stacked bar chart showing the job roles, count of employees and attrition.
+
+The knitted r-markdown document has made some of the job roles a bit harder to read, so I have abbreviated these in the following charts. For your reference the full names are: Healthcare, Human Resources, Lab Technician, Manager, Manufacturing Director, Research Director, Research Scientist, Sales Executive and Sales Representative.
+
+```{r jobrolebar, echo = FALSE}
+ggplot(data = training, aes(x = JobRole, fill = Attrition)) +
+  geom_bar(stat = "count", colour = "black") +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_fill_manual(values = c("azure3", "firebrick")) +
+  scale_x_discrete(labels = c("Health","HR","Lab Tech","Manager","Manuf Dir","Res Dir","Res Sci","Sales Exec","Sales Rep"))
+```
+
+But I believe it's more interesting to look at the relative frequencies and re-order them in the chart. I've also used specific colours based on whether the attrition rate is higher than the average.
+
+From this we get a clear picture of the job roles which have the highest attrition rate.
+
+```{r jobrolefreq}
+jobrolefreq <- training %>% 
+  group_by(JobRole, Attrition) %>% 
+  summarise(Number = n()) %>% 
+  mutate(Freq = Number / sum(Number)) %>% 
+  arrange(desc(Attrition),desc(Freq)) %>% 
+  filter(Attrition == 'Yes')
+```
+
+```{r freqplot, echo = FALSE}
+ggplot(data = jobrolefreq, aes(x = JobRole, y = (100*Freq), fill = JobRole)) +
+  geom_bar(stat = "identity", colour = "black") +
+  scale_x_discrete(limits = c("Sales Representative","Laboratory Technician","Human Resources","Sales Executive","Research Scientist","Healthcare Representative","Manufacturing Director","Manager","Research Director"),
+                   labels = c("Sales Rep","Lab Tech","HR","Sales Exec","Res Sci","Health","Manuf Dir","Manager","Res Dir")) +
+  scale_fill_manual(values = c("azure3","firebrick","firebrick","azure3","azure3","azure3","#666666","firebrick","firebrick")) +
+  guides(fill = FALSE) +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "none",
+        legend.justification = 0,
+        panel.grid = element_blank()) +
+  labs(title = 'Relative Frequencies of Attrition by Job Role',
+       subtitle = 'Those in red have a frequency higher than the average of 16%') +
+  geom_text(aes(label = round(100*Freq), size = 1, hjust = 0.5, vjust = -0.5)) +
+  guides(fill = FALSE)
+```
+
+We could explore this with some of the other variables to see if it's due to a correlation between other factors being more prevalent. This is probably beyond the scope of this analysis, but I'll show a few quick examples.
+
+From these boxplots, we can see that those job roles with higher attrition are more entry level roles with lower salaries. The Sales Executives confound this a little though and might be worth checking out further.
+
+Some further analysis may also require domain knowledge and consultation with people involved, for example speaking to those in the roles/teams as to whether there are specific challenges - individuals who are hard to work with, hard deadlines, or other things the data may not tell us at the moment.
+
+```{r boxplots, echo = FALSE}
+monthinc <- ggplot(data = training, aes(x = JobRole, y = MonthlyIncome, fill = JobRole)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_x_discrete(limits = c("Sales Representative","Laboratory Technician","Human Resources","Sales Executive","Research Scientist","Healthcare Representative","Manufacturing Director","Manager","Research Director"),
+                   labels = c("Sales Rep","Lab Tech","HR","Sales Exec","Res Sci","Health","Manuf Dir","Manager","Res Dir")) +
+  scale_fill_manual(values = c("azure3","firebrick","firebrick","azure3","azure3","azure3","#666666","firebrick","firebrick")) +
+  guides(fill = FALSE) +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "none",
+        legend.justification = 0)
+
+# Age
+age <- ggplot(data = training, aes(x = JobRole, y = Age, fill = JobRole)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_x_discrete(limits = c("Sales Representative","Laboratory Technician","Human Resources","Sales Executive","Research Scientist","Healthcare Representative","Manufacturing Director","Manager","Research Director"),
+                   labels = c("Sales Rep","Lab Tech","HR","Sales Exec","Res Sci","Health","Manuf Dir","Manager","Res Dir")) +
+  scale_fill_manual(values = c("azure3","firebrick","firebrick","azure3","azure3","azure3","#666666","firebrick","firebrick")) +
+  guides(fill = FALSE) +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "none",
+        legend.justification = 0)
+
+# TotalWorkingYears
+work <- ggplot(data = training, aes(x = JobRole, y = TotalWorkingYears, fill = JobRole)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_x_discrete(limits = c("Sales Representative","Laboratory Technician","Human Resources","Sales Executive","Research Scientist","Healthcare Representative","Manufacturing Director","Manager","Research Director"),
+                   labels = c("Sales Rep","Lab Tech","HR","Sales Exec","Res Sci","Health","Manuf Dir","Manager","Res Dir")) +
+  scale_fill_manual(values = c("azure3","firebrick","firebrick","azure3","azure3","azure3","#666666","firebrick","firebrick")) +
+  guides(fill = FALSE) +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "none",
+        legend.justification = 0)
+
+grid.arrange(monthinc, age, work)
+```
+
+## Pre-Processing
+
+We'll take the logarithms of a few numeric features to transform them into more normal distributions. For example, Monthly Income is right skewed and would benefit from taking the logarithm value.
+
+```{r disthisto, echo = FALSE}
+histogram(training$MonthlyIncome, col = 8)
+
+histogram(log(training$MonthlyIncome), col = 8)
+```
+
+I also like to use the corr package as a quick guide as to whether using the logarithm improves the correlation magnitude.
+
+```{r corrmonthly, echo = FALSE}
+training %>% 
+  select(Attrition, MonthlyIncome) %>% 
+  mutate(
+    Attrition = Attrition %>% as.factor() %>% as.numeric(),
+    Log = log(MonthlyIncome)
+  ) %>% 
+  correlate() %>% 
+  focus(Attrition) %>%
+  fashion()
+```
+
+Sometimes discretizing (binning) numeric features into groups can help the model to make general assumptions. For example, we can see a clear cut correlation between younger age and attrition so we'll make this distinction more evident to the model.
+
+```{r agebin, echo = FALSE}
+ggplot(data = training, aes(x = Age, fill = Attrition)) +
+  geom_histogram(binwidth = 18, colour = "white") +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_fill_manual(values = c("azure4", "firebrick")) +
+  labs(title = 'Discretizing Age Variable')
+```
+
+We'll also hot encode categorical variables. Although this isn't required by many models, it is required by some algorithms I like using (e.g. xgBoost) and is also required by the corrr package which I'll be using to give further insight on different features.
+
+Then we'll scale and center all the features for good measure.
+
+```{r recipe}
+rec_obj <- recipe(Attrition ~ ., data = training) %>% 
+  step_log(DistanceFromHome, MonthlyIncome, JobLevel) %>% 
+  step_discretize(Age, options = list(cuts = 3)) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_center(all_predictors(), -all_outcomes()) %>% 
+  step_scale(all_predictors(), -all_outcomes()) %>% 
+  prep(data = training)
+
+trainingObj <- bake(rec_obj, newdata = training)
+validatingObj <- bake(rec_obj, newdata = validating)
+testingObj <- bake(rec_obj, newdata = testing)
+```
+
+Lastly, we'll deal with the outcome class imbalance.
+
+As we mentioned earlier, there is a large imbalance with only 16% "Yes" outcomes. As such, we're going to use the SMOTE method to generate a new balanced dataset. Basically what this does is uses the nearest neighbours to generate more minority class cases.
+
+You can see the split is now 50/50.
+
+```{r smote}
+trainingObj <- SMOTE(Attrition ~ ., as.data.frame(trainingObj), perc.over = 100, perc.under = 200)
+
+summary(trainingObj$Attrition)
+```
+
+## H2O Modelling
+
+I've recently been using and thoroughly enjoying the H2O package, in particular the auto_ml function makes the machine learning process a lot easier, taking care of grid search and running numerous iterations of models to keep the best version.
+
+This basically performs all computations in highly optimized Java code in the H2o cluster, intiated by REST calls from R.
+
+First we conver the data into H2o frames and prepare the auto_ml specifying a maximum time to run, in this instance 5 minutes.
+
+```{r h2o}
+h2o.init()
+h2o.no_progress()
+
+train_h2o <- as.h2o(trainingObj)
+valid_h2o <- as.h2o(validatingObj)
+test_h2o <- as.h2o(testingObj)
+
+y <- "Attrition"
+x <- setdiff(names(train_h2o), y)
+
+automl_models_h2o <- h2o.automl(
+  x = x,
+  y = y,
+  training_frame = train_h2o,
+  leaderboard_frame = valid_h2o,
+  max_runtime_secs = 300
+)
+
+automl_models_h2o@leaderboard
+```
+
+The leader evidently is a deep learning model with a good AUC value, we can look at further details and metrics.
+
+```{r h2oleader}
+automl_models_h2o@leader
+```
+
+Then we can make the predictions on the test set and check the accuracy.
+
+As we touched on before, as we are most concerned with the "Yes" outcome, the most important measures for us are precision and recall. I.e. how many "Yes" outcomes we get are able to identify and how many we identify are false positives.
+
+```{r h2oassess}
+model <- automl_models_h2o@leader
+
+pred_h2o <- h2o.predict(object = model, newdata = test_h2o)
+
+test_performance <- test_h2o %>%
+  tibble::as_tibble() %>%
+  select(Attrition) %>%
+  add_column(pred = as.vector(pred_h2o$predict)) %>%
+  mutate_if(is.character, as.factor)
+
+confusion_matrix <- test_performance %>%
+  table() 
+confusion_matrix
+
+tn <- confusion_matrix[1]
+tp <- confusion_matrix[4]
+fp <- confusion_matrix[3]
+fn <- confusion_matrix[2]
+
+accuracy <- (tp + tn) / (tp + tn + fp + fn)
+misclassification_rate <- 1 - accuracy
+recall <- tp / (tp + fn)
+precision <- tp / (tp + fp)
+null_error_rate <- tn / (tp + tn + fp + fn)
+
+tibble(
+  accuracy,
+  misclassification_rate,
+  recall,
+  precision,
+  null_error_rate
+) %>% 
+  transpose()
+```
+
+So out of those that leave, we're able to predict a high % of these (recall), but of our predictions we're still getting quite a few wrong. As this isn't a huge number of employees we're probably not too concerned about this and unfortunately as this is a randomly generated dataset it's harder to improve too much upon this.
+
+## Random Forest Modelling
+
+Although we're fairly happy with the H2o model, let's quickly compare it against one of my other favourite algorithms the Random Forest.
+
+This is an algorithm I use with the Caret package quite a lot although it can be computatonally intensive, so I also often use the xgBoost gradient boosted tree model which has an amazing execution speed.
+
+First, I'll set the model parameters with the trainControl function, then run the model and make predictions against the test set.
+
+```{r rf}
+fitControl <- trainControl(method = "repeatedcv", number = 4, repeats = 4)
+
+rfmodFit <- train(Attrition ~ ., data = trainingObj, method = "rf",trControl = fitControl, prox=TRUE)
+
+rfpred <- predict(rfmodFit, testingObj)
+
+confusionMatrix(rfpred, testingObj$Attrition)
+```
+
+We're seeing results of 84% accuracy, which is higher than the deep learning model, but this Random Forest model is only picking up 50% of those who leave.
+
+## Measuring ROC Curve
+
+To assess both of these models we will plot ROC curves. The 45 degree dotted line indicates taking a random guess and generally a rule of thumb is to draw a line at 0.5 on the X-axis then if it's above 0.7 on the y-axis then it's a good model and anything over 0.9 is usually overfit.
+
+Can see H2o's deep learning model is performing better than the Random Forest model, but both are good models.
+
+```{r roc, echo = FALSE}
+h2opred <- ifelse(as.data.frame(pred_h2o$predict) == 'Yes',1,0)
+h2otest <- ifelse(as.data.frame(test_h2o$Attrition) == 'Yes',1,0)
+
+rfpred <- ifelse(rfpred == 'Yes',1,0)
+rftest <- ifelse(testingObj$Attrition == 'Yes',1,0)
+
+# H2o
+plot(performance(prediction(h2opred, h2otest), measure = 'tpr', x.measure = 'fpr'), col = "red", lwd = 2, main = "H2O ROC")
+abline(a=0, b= 1, lty = 5, col = 4)
+abline(v = 0.5, lty = 3)
+abline(h = 0.7, lty = 3)
+abline(h = 0.9, lty = 3)
+
+# Random Forest
+plot(performance(prediction(rfpred, rftest), measure = 'tpr', x.measure = 'fpr'), col = "red", lwd = 2, main = "RF ROC")
+abline(a=0, b= 1, lty = 5, col = 4)
+abline(v = 0.5, lty = 3)
+abline(h = 0.7, lty = 3)
+abline(h = 0.9, lty = 3)
+```
+
+## Rank Features by their Correlation with the Outcome
+
+This is probably my favourite way to really dig in and gain insights into the driving factors behind staying or leaving.
+
+This also verifies some of the things we found in our exploration around specific job roles like Sales Reps being more likely to leave.
+
+```{r corranalysis, echo = FALSE}
+corrr_analysis <- trainingObj %>%
+  mutate(Attrition = ifelse(trainingObj$Attrition == 'Yes',1,0)) %>%
+  correlate() %>%
+  focus(Attrition) %>%
+  rename(feature = rowname) %>%
+  arrange(abs(Attrition)) %>%
+  mutate(feature = as_factor(feature))
+
+corrchurn <- corrr_analysis %>% 
+  top_n(10, Attrition)
+corrstay <- corrr_analysis %>% 
+  top_n(10, desc(Attrition))
+correlation <- corrchurn %>% 
+  rbind(corrstay)
+
+correlation %>%
+  ggplot(aes(x = Attrition, y = fct_reorder(feature, desc(Attrition)))) +
+  geom_point() +
+  geom_segment(aes(xend = 0, yend = feature), 
+               color = palette_light()[[2]], 
+               data = correlation %>% filter(Attrition > 0)) +
+  geom_point(color = palette_light()[[2]], 
+             data = correlation %>% filter(Attrition > 0)) +
+  # Negative Correlations - Prevent churn
+  geom_segment(aes(xend = 0, yend = feature), 
+               color = "chartreuse4", 
+               data = correlation %>% filter(Attrition < 0)) +
+  geom_point(color = "chartreuse4", 
+             data = correlation %>% filter(Attrition < 0)) +
+  # Vertical lines
+  geom_vline(xintercept = 0, color = palette_light()[[5]], size = 1, linetype = 2) +
+  geom_vline(xintercept = -0.25, color = palette_light()[[5]], size = 1, linetype = 2) +
+  geom_vline(xintercept = 0.25, color = palette_light()[[5]], size = 1, linetype = 2) +
+  # Aesthetics
+  theme_bw() +
+  labs(title = "Attrition Correlation Analysis",
+       subtitle = "Negative Correlations in Green (prevent Attrition),
+Positive Correlations in Red (contribute to Attrition)
+",
+       y = "Feature Importance")
+```
+
+## Actionable Insights
+
+So how can we actually use this information? 
+
+With many in analytics and data science, it seems simple building the model is where everything stops without too much thought on how to actually use this information. But where we actually create value is deploying and using the model in a business sense.
+
+First we can look at the test cases and specific employees with not only the predictions, but also the probabilities of each class.
+
+One way we could use the model is by looking at those where the "Yes" probability is highest and then seeing how we can change this outcome by taking action with the employee. This is an approach I've used previously where reducing false positives is extremely important and often where model accuracy is a bit lower. If you narrow down to those customers where the model is most confident, then you can often see accuracies over 90%. Again, in this case due to the problems with this dataset it doesn't help too much, but it is an option all the same.
+
+```{r fullperformance}
+full_performance <- test_h2o %>%
+  tibble::as_tibble() %>%
+  select(Attrition) %>%
+  add_column(EmployeeNumber = as.vector(testing2$EmployeeNumber)) %>% 
+  add_column(Prediction = as.vector(pred_h2o$predict)) %>%
+  add_column(No = formatC(as.vector(pred_h2o$No),digits = 8, format = "f")) %>%
+  add_column(Yes = formatC(as.vector(pred_h2o$Yes),digits = 8, format = "f")) %>%
+  mutate_if(is.character, as.factor) %>% 
+  mutate(Result = ifelse(Attrition == Prediction, "Correct","Incorrect")) %>% 
+  filter(Prediction == 'Yes', as.numeric(Yes) > 0.8) %>% 
+  arrange(desc(as.numeric(Yes)))
+
+head(full_performance, n = 6)
+
+full_performance %>% 
+  group_by(Result) %>% 
+  summarise(Number = n()) %>% 
+  mutate(Freq = Number / sum(Number))
+```
+
+Next we can focus on individual customers and see which factors are driving the predictions, thus we can narrow down more specific insights on how to potentially change the outcome of them leaving. 
+
+For example, in case 4 we can see this employee is being predicted to leave based on the fact they are young, haven't worked in many companies and have worked overtime. So, we could perhaps take extra care and put them on a career path or increase their Stock Option level.
+
+```{r lime, echo = FALSE}
+model_type.H2OBinomialModel <- function(x, ...) {
+  return("classification")
+}
+
+predict_model.H2OBinomialModel <- function(x, newdata, type, ...) {
+  pred <- h2o.predict(x, as.h2o(newdata))
+  return(as.data.frame(pred[,-1]))
+}
+
+predict_model(x = model, newdata = as.data.frame(test_h2o[,-1]), type = 'raw') %>%
+  tibble::as_tibble()
+
+# Explainer & Explain ( n labels = 1 is single class)
+explainer <- lime::lime(
+  as.data.frame(train_h2o[,-1]), 
+  model          = model, 
+  bin_continuous = FALSE)
+
+explanation <- lime::explain(
+  as.data.frame(test_h2o[1:4,-1]), 
+  explainer    = explainer, 
+  n_labels     = 1, 
+  n_features   = 4)
+# Feature Importance Plot
+plot_features(explanation) +
+  labs(title = "Customer Attrition Predictive Analytics: LIME Feature Importance",
+       subtitle = "Hold Out (Test) Set, First 10 Cases Shown")
+```
+
+Eventually we could build these insights into a data product like an interactive Shiny web app, allowing us to focus on the employees most at risk of leaving and the relevant insights we need.
