@@ -1,0 +1,520 @@
+---
+title: "E-commerce Customer & Sales Insights"
+author: "Rhys Tutt"
+date: "22 December 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+For this analysis I'll be using the tidyquant package (loads many packages from the TidyVerse), plotly (interactive charts), countrycode (to derive iso country codes from country names) and a few other packages I like to use for visualizations - gridExtra, ggthemes & scales.
+
+Also, for the sake of full explanation, I had some issues with the dates being in a US format and so upon importing in Excel they were being formatted to the wrong dates. This requred a bit of manipulation in Excel, which I did by uploading the file as a text data source, changing the formatting of the dates column to text, then stripping the various parts of the date into different columns and combining them using concatenate (fairly quick 10 min process). E.g. formulas like =LEFT(E2,FIND("/",E2)-1) & =MID(E2,3,FIND("/",E2)).
+
+You can see the old column "OldInvoiceDate" below and the various different date components I pulled from this.
+
+```{r packages, include = FALSE, message = FALSE}
+library(tidyquant)
+library(plotly)
+library(countrycode)
+library(cluster)
+library(gridExtra)
+library(ggthemes)
+library(scales)
+library(bindrcpp)
+```
+
+```{r WD, echo = FALSE}
+setwd("T:\\Risk Management\\Rhys\\IMPORTANT\\R\\Kaggle\\Ecommerce Dataset")
+```
+
+```{r }
+set.seed(123)
+dataset <- read.csv("dataset2.csv")
+glimpse(dataset)
+```
+
+## Data Clean-Up & Preparation
+
+First we look to see if there are any missing values, we can see CustomerID appears to be optional, this is common with e-commerce data as registering an account is not compulsory.
+
+We don't want to impute any data here, just need to keep it in mind when analysing further, e.g. we wouldn't place all the importance on counting distinct customers.
+
+```{r }
+head(dataset[!complete.cases(dataset),])
+```
+  
+Can also see there are some 0 values for quanities and prices. This could be useful to analyse what products are being abandoned and if there are any trends that may be indicative of software errors on the business end or similar. But for the purpose of this analysis I'm going to remove those with a price of 0 or a quantity of 0 items purchased.
+
+```{r }
+dataset <- dataset %>% 
+  filter(UnitPrice > 0, Quantity > 0 ) 
+```
+  
+I intend to perform some analysis by country, there are often different naming conventions so will look at this feature.
+
+```{r }
+summary(dataset$Country)
+```
+
+Can see a few issues here -  EIRE is an old way of saying Republic of Ireland, Channel Islands is actually a group of two islands which will make it hard to obtain the country code so I will just re-name it to one of them (Jersey), European Community is very non-specific but not much we can do here, RSA is a bit ambiguous so will re-name to Republic of South Africa, and there are some Unspecified values but there's not much we can do about those.
+
+```{r }
+dataset$Country <- as.character(dataset$Country)
+
+dataset <- dataset %>% 
+  mutate(Country = replace(Country, Country == "EIRE","Republic of Ireland")) %>% 
+  mutate(Country = replace(Country, Country == "RSA","Republic of South Africa")) %>% 
+  mutate(Country = replace(Country, Country == "Channel Islands","Jersey"))
+
+dataset$Country <- as.factor(dataset$Country)
+
+summary(dataset$Country)
+```
+
+We would probably want to have a word to the software developer team to see if we can have some sort of address validation or an improved country dropdown list implemented to suit our requirements.
+
+## Country Analysis
+
+We'll summarise the data by Country as this will be interesting to delve into where our customers are coming from.
+
+```{r }
+country <- dataset %>% 
+  group_by(Country) %>% 
+  summarise(CountCustomers = n_distinct(CustomerID),
+            CountInvoices = n_distinct(InvoiceNo),
+            SumPurchases = sum(Quantity * UnitPrice)) %>% 
+  arrange(desc(CountCustomers)) %>% 
+  mutate(CountryCode = countrycode(sourcevar = Country, "country.name", "iso3c"))
+
+head(country)
+```
+
+Using plotly I'll build an interactive map to visualize these insights.
+
+As we can see, most of the revenue is coming from Europe, which is obviously important to know for a variety of logistical and marketing reasons.
+
+```{r, plotly = TRUE, echo = FALSE}
+l <- list(color = toRGB("grey"), width = 0.5)
+
+g <- list(
+  showframe = FALSE,
+  showcoastlines = FALSE,
+  projection = list(type = 'Mercator'))
+
+p <- plot_geo(country) %>% 
+  add_trace(
+    z = ~SumPurchases, color = ~SumPurchases, colors = 'Blues',
+    text = ~Country, locations = ~CountryCode, marker = list(line = l)) %>% 
+  colorbar(title = "Total Purchases") %>% 
+  layout(
+    title = "Sales By Country",
+    geo = g
+  )
+
+p
+```
+
+One thing I would mention is that depending on the business, we may want to try and expand our market into other countries not only to continue growth but also greater diversify the business risk.
+
+As you can see below, the UK makes up almost 85% of our revenue and if something were to happen in this market, e.g. the introduction of a new competitor or a legislation change outside of our control, this could be catastrophic for our business.
+
+So I suggest it would be prudent to hedge this risk and focus on growing some of our other market shares.
+
+```{r }
+country <- country %>% 
+  mutate(TotalPurchases = sum(SumPurchases))
+  
+select(
+  country %>% 
+  group_by(Country) %>% 
+  mutate(Freq = formatC(100.0 * (SumPurchases / TotalPurchases), digits = 2, format = "f")) %>%
+  arrange(desc(Freq))
+  , Country, SumPurchases,Freq)
+
+```
+
+## Order Insights
+
+We could group all the items by invoice number and perform some analysis, like clustering. I did this and didn't include it in this analysis as nothing too interesting was found.
+
+```{r }
+invoices <- 
+  dataset %>% 
+  group_by(InvoiceNo, CustomerID, InvoiceDate) %>% 
+  summarise(NumItems = n_distinct(Description),
+            TotalQuantity = sum(Quantity),
+            TotalAmount = sum(Quantity * UnitPrice),
+            AvgUnitPrice = mean(UnitPrice),
+            AvgItemAmount = mean(Quantity * UnitPrice))
+```
+
+Instead I'll just add an aggregated colum summing the quantity and unit price.
+
+```{r }
+orders <- 
+  dataset %>% 
+  group_by(InvoiceNo, CustomerID, InvoiceDate, Period, Description, UnitPrice) %>% 
+  summarise(TotalQuantity = sum(Quantity),
+            TotalAmount = sum(Quantity * UnitPrice))
+
+head(orders)
+```
+
+We can then plot the price and quantity on a chart and can see that as price increases, the quantity bought naturally decreases (as is the case in most environments).
+
+```{r ,echo = FALSE}
+ggplot(data = orders, aes(x = UnitPrice, TotalQuantity)) +
+  geom_point(position = "jitter", colour = "navyblue") +
+  coord_cartesian(xlim = c(0, 5000), ylim = c(0, 5000)) +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma)
+```
+
+Next we can perform some basic analysis by date.
+
+```{r ,echo = FALSE}
+
+sumbydate <- 
+  orders %>% 
+  group_by(Period) %>% 
+  summarise(TotalQuantity = sum(TotalQuantity),
+            TotalAmount = sum(TotalAmount))
+
+sumbydate$Period <- factor(sumbydate$Period,
+                           levels = c('2010-12','2011-1','2011-2','2011-3','2011-4','2011-5','2011-6','2011-7','2011-8','2011-9','2011-10','2011-11','2011-12'),
+                           labels = c("Dec-10","Jan-11","Feb-11","Mar-11","Apr-11","May-11","Jun-11","Jul-11","Aug-11","Sep-11","Oct-11","Nov-11","Dec-11"))
+```
+
+Then we plot this in a bar chart and use the "scales" package for the formatting of y axis with commas. I like to make sure all the little things are done right as it makes a big difference in aesthetic and interpretability.
+
+
+```{r ,echo = FALSE}  
+ggplot(data = sumbydate, aes(x = Period, y = TotalAmount, fill = Period)) +
+  geom_bar(stat = "identity") +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_fill_manual(values = c("darkgrey","darkgrey","darkgrey","darkgrey","darkgrey","darkgrey","darkgrey","darkgrey","darkgrey","navyblue","navyblue","navyblue","firebrick")) +
+  scale_y_continuous(labels = comma) +
+  guides(fill = FALSE) +
+  labs(title = 'Monthly Purchases Building Nicely',
+       subtitle = 'Increasing towards end of 2011, Dec is only 1/3 complete so set to be our biggest month yet.')
+```
+
+
+This could then lead into more advanced forecasting but that's beyond the scope of this insights analysis.
+
+In a real business enviornment, I have previously written SQL queries with while loops and then associated KPI month-to-date infographics in R to track the progress of sales compared to the same time in previous months and ROI benchmarks.
+
+
+## Customer Insights
+
+By running an un-supervised machine learning algorithm like k-means clustering, we can find patterns or groupings in the data which we weren't aware of previously. This is especially valuable as rather than looking for pre-determined information, clustering can identify hidden patterns we hadn't realised before.
+
+Also worth noting, although the following charts are a more polished product, I first explore the variables very quickly using the base plotting system.
+
+First, we'll group the customers by their CustomerID and perform some aggregations which I'll use in further plots, then we'll remove those customers who don't have a CustomerID.
+
+```{r }  
+customers <- 
+  dataset %>% 
+  group_by(CustomerID) %>% 
+  summarise(NumInvoices = n_distinct(InvoiceNo),
+            NumItems = n_distinct(Description),
+            TotalItemQuantity = sum(Quantity),
+            TotalAmount = sum(Quantity * UnitPrice),
+            AvgUnitPrice = mean(UnitPrice),
+            AvgItemAmount = mean(Quantity * UnitPrice)) %>% 
+  mutate(AvgInvoiceAmount = TotalAmount / NumInvoices)
+
+customers <- customers[complete.cases(customers),]
+
+glimpse(customers)
+```
+
+We'll use the elbow method to determine the best number of clusters that explain the most variability within the data.
+
+```{r }  
+set.seed(123)
+wcss <- vector()
+for (i in 1:10) wcss[i] <- sum(kmeans(customers[,c(2:7)], i)$withinss)
+plot(1:10, wcss, type = 'b', main = paste("Clusters of Customers"), xlab = "Number of clusters", ylab = "MCSS") 
+```
+
+Then we run the k-means algorithm, specifying we want 4 clusters, a maximum of 300 iterations and 10 random starts.
+
+```{r } 
+set.seed(123)
+kmeans <- kmeans(customers[,c(2:7)], centers = 4, iter.max = 300, nstart = 10)
+table(kmeans$cluster)
+```
+
+We'll add these clusters to the customers table and label them based on their value (these definitions will become apparent): 4 = lower value, 1 = mid value, 3 = higher value, 2 = top value.
+
+This is not to say those of low value are not important to our business, but by segmenting them by total value we can better analyse their differences.
+
+```{r } 
+customers <- 
+  customers %>% 
+  add_column(Cluster = kmeans$cluster)
+
+customers$Cluster <- factor(customers$Cluster,
+                            levels = c(4,1,3,2),
+                            labels = c("Low","Medium","High","Top"))
+```
+
+If we plot this data we can see a natural segmentation within the data by total item quantity and total amount purchased.
+
+```{r ,echo = FALSE} 
+ggplot(data = customers, aes(x = TotalItemQuantity, y = TotalAmount, colour = Cluster)) +
+  geom_point(size = 4, alpha = 0.9) +
+  theme_tq() +
+  theme(
+        #panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0,
+        legend.background = element_rect(fill = "grey98")) +
+  scale_y_continuous(labels = comma) +
+  scale_x_continuous(labels = comma) +
+  scale_colour_tableau() +
+  labs(title = 'Natural Segmentation by Total Quantity and Amount',
+       colour = 'Cluster',
+       y = 'Total Purchases',
+       x = 'Total Item Quantity')
+```
+
+To understand the Clusters better, we can look at the proportions these segments make up of our customer base and total revenue. Often you will see Pareto's principle where 80% of the profits come from 20% of customers. In our dataset, it is evident that around 3% of our customer base is accounting for around 42% of our total purchases. 
+
+Although if we delved even deeper into the actual distinct customers, I'd argue we would probably see Pareto's principle evident in the data, but we won't dive that deep in this analysis.
+
+```{r } 
+totalrevenue <- sum(customers$TotalAmount)
+totalcustomers <- n_distinct(customers$CustomerID)
+
+customerfreq <- 
+  customers %>% 
+  group_by(Cluster) %>% 
+  summarise(CountCustomers = n(),
+            TotalPurchases = sum(TotalAmount)) %>% 
+  mutate(PurchaseFreq = formatC(100 * TotalPurchases / totalrevenue, digits = 2, format = "f"),
+         CountFreq = formatC(100 * CountCustomers / totalcustomers, digits = 2, format = "f"))
+```
+
+Plotting these relative proportions side-by-side will make my point more evident.
+
+```{r ,echo = FALSE} 
+a <- ggplot(data = customerfreq, aes(x = Cluster, y = as.numeric(PurchaseFreq), fill = Cluster)) +
+  geom_bar(stat = "identity") +
+  ylim(0,100) +
+  theme_tq() +
+  theme(
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_blank(),
+        axis.text = element_text(colour = "#666666"),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_fill_tableau() +
+  labs(title = 'Percentage Purchase Contribution') +
+  geom_text(aes(label=round(as.numeric(PurchaseFreq),0), size=1, hjust=0.5, vjust=-0.5)) +
+  theme(legend.position='none')
+
+
+b <- ggplot(data = customerfreq, aes(x = Cluster, y = as.numeric(CountFreq), fill = Cluster)) +
+  geom_bar(stat = "identity") +
+  ylim(0,100) +
+  theme_tq() +
+  theme(
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_blank(),
+        axis.text = element_text(colour = "#666666"),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_fill_tableau() +
+  labs(title = 'Percentage Customer Contribution') +
+  geom_text(aes(label=round(as.numeric(CountFreq),2), size=1, hjust=0.5, vjust=-0.5)) +
+  theme(legend.position='none')
+  
+grid.arrange(b,a,ncol = 2)
+```
+
+So now that we understand a bit more about our customer base, we would obviously want to gain further insights on the different segments and how best to approach each of them.
+
+First, we can plot the number of invoices each customer has made and the number of items they purchased on each invoice. So we can see that value isn't necessarily about the sheer number of invoices, but rather the number of items per invoice. We can also extrapolate from this data that our higher value segments are  big distributors or wholesale customers.
+
+```{r ,echo = FALSE} 
+ggplot(data = customers, aes(x = NumInvoices, y = TotalItemQuantity, colour = Cluster)) +
+  geom_point(size = 4, alpha = 0.9) +
+  theme_tq() +
+  theme(
+        #panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0,
+        legend.background = element_rect(fill = "grey98")) +
+  scale_y_continuous(labels = comma) +
+  scale_x_continuous(labels = comma) +
+  scale_colour_tableau() +
+  labs(title = 'Number of Invoices vs Total Items',
+       subtitle = '',
+      colour = 'Cluster',
+       x = 'Number of Invoices',
+       y = 'Total Item Quantity')
+```
+
+We can also see different trends in the chart below, for example our top customers often order a smaller variety of items in bulk, whereas our lower level customers (probably regular retail customers) usually order a smaller quantity of a wider variety of items.
+
+```{r ,echo = FALSE} 
+ggplot(data = customers, aes(x = NumItems, y = TotalItemQuantity, colour = Cluster)) +
+  geom_point(size = 4, alpha = 0.9) +
+  theme_tq() +
+  theme(
+        #panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0,
+        legend.background = element_rect(fill = "grey98")) +
+  scale_y_continuous(labels = comma) +
+  scale_x_continuous(labels = comma) +
+  scale_colour_tableau() +
+  labs(title = 'Variety of Items vs Total Items',
+       subtitle = '',
+       colour = 'Cluster',
+       x = 'Number of Different Items',
+       y = 'Total Item Quantity')
+```
+
+Another interesting observation is that the higher value groups average unit price is lower, so they're buying large quantities of low priced items.
+
+```{r ,echo = FALSE} 
+ggplot(data = customers, aes(x = AvgUnitPrice, y = TotalAmount, colour = Cluster)) +
+  geom_point(size = 4, alpha = 0.9) +
+  theme_tq() +
+  theme(
+        #panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0,
+        legend.background = element_rect(fill = "grey98")) +
+  scale_y_continuous(labels = comma) +
+  scale_x_continuous(labels = comma) +
+  scale_colour_tableau() +
+  labs(title = 'Higher Value Purchasing Cheaper Items',
+       subtitle = '',
+       colour = 'Cluster',
+       x = 'Average Unit Price',
+       y = 'Total Purchases')
+```
+
+If we look further at the average invoice amounts, we can see those of higher value usually have a mid range number of invoices and mid level amounts, whereas our lower segments might have more invoices of lower value.
+
+So value is actually being driven largely by the number of items purchased.
+
+```{r ,echo = FALSE} 
+ggplot(data = customers, aes(x = AvgInvoiceAmount, y = NumInvoices, colour = Cluster)) +
+  geom_point(size = 4, alpha = 0.9) +
+  theme_tq() +
+  theme(
+        #panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0,
+        legend.background = element_rect(fill = "grey98")) +
+  scale_y_continuous(labels = comma) +
+  scale_x_continuous(labels = comma) +
+  scale_colour_tableau() +
+  labs(title = 'Average Invoice Amount vs Number Of Invoices',
+       subtitle = '',
+       colour = 'Cluster',
+       x = 'Average Invoice Amount',
+       y = 'Number Of Invoices')
+```
+
+## Conclusion
+
+So we can actually start using this information for various business operations like driving marketing strategy. For example, we could target our higher value segments (wholesalers) with a more specific selection of items and offer bulk discounts; whereas with our lower value segment (regular retail customers) we might offer a wider array of items with percentage discount offers.
+
+With these regular retail customers, there would also be scope to do some collaborative filtering or build a recommendation system to assist us with which specific items to advertise to each customer based on what similar customers have purchased.
+
+These are obviously just a few methods of gaining insights and the next possibilites here are endless, but some common steps I would look at taking next would be trying to assign a customer lifetime value (CLV), performing RFM segmentation based on the recency, frequency, and monetary amount spent, and then performing further clustering.
