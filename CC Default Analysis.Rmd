@@ -1,0 +1,527 @@
+---
+title: "Credit Card Default Analysis"
+author: "Rhys Tutt"
+date: "12 January 2018"
+output: html_document
+---
+
+## Background
+
+This dataset was obtained on Kaggle and comes from the UCI Machine Learning Repository. The description of the dataset and the values of the variables can be found at the following link: https://www.kaggle.com/uciml/default-of-credit-card-clients-dataset. 
+
+In short, it contains information on default payments, demographic factors, credit data, history of payment, and bill statements of credit card clients in Taiwan from April 2005 to September 2005.
+
+This is just a quick analysis being performed firstly to demonstrate some quick exploratory data analysis and then to build a few different machine learning models to predict whether a customer will default. This should also show how we can explore the data hand-in-hand with the modelling process.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+For this analysis I'll be using a few of my go-to packages as well as a few additional ones I just use from time to time.
+
+For data manipulation, general analysis and plotting - tidyquant, Amelia, knitr, scales, ggthemes, kableExtra; data pre-processing - DMwR, recipes, corrplot, corrr; modelling - caret, h2o, xgboost, ROCR.
+
+```{r packages, include = FALSE, message = FALSE}
+library(tidyquant)
+library(Amelia)
+library(knitr)
+library(scales)
+library(ggthemes)
+library(kableExtra)
+library(DMwR)
+library(corrr)
+library(corrplot)
+library(recipes)
+library(caret)
+library(h2o)
+library(xgboost)
+library(ROCR)
+```
+
+```{r WD, echo = FALSE}
+setwd("T:\\Risk Management\\Rhys\\IMPORTANT\\R\\Kaggle\\Default of CC Clients Dataset")
+```
+
+```{r }
+set.seed(123)
+fulldataset <- read.csv("UCI_Credit_Card.csv", header = TRUE)
+glimpse(fulldataset)
+```
+
+## Initial Data Exploration & Clean-Up
+
+This is where we get our first look at the data, locate any missing data, understand a little of the structure and make some necessary changes.
+
+First we create a plot to easily locate any missing information, I think it's just a nice way to visualize everything. In any case, there is no missing data so that looks fine.
+
+```{r missmap}
+missmap(fulldataset, legend = TRUE, y.cex = 0.1, x.cex = 0.5)
+
+fulldataset[!complete.cases(fulldataset),]
+```
+
+Now we'll get rid of the ID column and I like to re-order the target variable as the first column and then the others in order of data type. Then we're going to convert some of the categorical variables to factors and lastly we'll take a look at the class balance of the target variable. This will be very important especially for the machine learning stage as if there's a big imbalance we may need to use a technique to deal with this.
+
+```{r cleanup}
+dataset <- 
+  fulldataset %>% 
+  select(default.payment.next.month, SEX:MARRIAGE,PAY_0:PAY_6,AGE,LIMIT_BAL,BILL_AMT1:PAY_AMT6)
+
+dataset[,c(1:10)] <- lapply(select(dataset, default.payment.next.month:PAY_6), function(var) as.factor(var))
+
+dataset <- rename(dataset, 'DEFAULT' = 'default.payment.next.month')
+
+dataset %>%
+  group_by(DEFAULT) %>% 
+  summarise(Number = n()) %>% 
+  mutate(Freq = formatC(Number / sum(Number),digits = 2, format = "f")) %>% 
+  kable()
+```
+
+There's only a slight imbalance here, so it's probably not going to give us much benefit treating this.
+
+
+## Exploratory Data Analysis
+
+One way we could do this is to just quickly plot all the variables against the Default outcome in bulk, in this case I'll just do this with the quantitive variables. So first I'll reformat them them into a format them and then plot them all using facets.
+
+It's quite hard to see here but you get the point.
+
+```{r quanti}
+quanti <- select_if(dataset, is.numeric)
+quanti <- cbind.data.frame(quanti, DEFAULT = dataset$DEFAULT)
+
+tidyquanti <- gather(quanti, variable, value, -DEFAULT)
+```
+
+```{r quantiplot,echo = FALSE}
+ggplot(tidyquanti, aes(x = value)) +
+  geom_density(aes(fill = DEFAULT)) +
+  facet_grid(. ~ variable, scales = "free")
+```
+
+Now I'll just explore a couple of the qualitative variables, mainly focusing on the Marriage variable as an example of how I would usually explore data. Just keep in mind that defaulting on your next payment = 1, not defaulting = 0.
+
+```{r marriage1,echo = FALSE}
+ggplot(dataset, aes(x = factor(MARRIAGE, labels = c("0yrs","10yrs","20yrs","30yrs")), fill = DEFAULT)) +
+  geom_bar(stat = "count") +
+  coord_flip() +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_fill_manual(values = c("darkgrey", "navyblue")) +
+  labs(x = 'Marriage', y = 'Count', title = 'Marriage Highly Skewed')
+```
+
+This will give you a further indication of what percentages of our customers fall into each marriage category - e.g. 45.5% married for 10 years, 53.2% married for 20 years.
+
+```{r marriage2}
+dataset %>% 
+  select(MARRIAGE) %>% 
+  group_by(MARRIAGE) %>% 
+  summarise(Count = n()) %>% 
+  mutate(Freq = as.numeric(formatC(100*Count / sum(Count),digits = 2, format = "f")))
+```
+
+We can then focus on these default percentages further and plot them for easier visibility. I'm also re-naming the factor levels of the Marriage variable so the audience can understand the message being conveyed more easily. 
+
+In regards to the plot, it's worth noting that I would often re-order the categories in order of Frequency % values as it's a bit more aesthetically pleasing, but in this case there is a natural order to the x-variables 0-30 years so it makes more sense leaving them. Also I've removed the y-axis labels and replaced this with direct labels on the bars.
+
+```{r marriage3}
+marriage <- 
+  dataset %>% 
+  select(MARRIAGE, DEFAULT) %>% 
+  group_by(MARRIAGE, DEFAULT) %>% 
+  summarise(Count = n()) %>% 
+  mutate(Freq = formatC(100*(Count / sum(Count)), digits = 0, format = "f")) %>% 
+  filter(DEFAULT == 1) %>% 
+  arrange(desc(Freq))
+
+marriage$MARRIAGE <- factor(marriage$MARRIAGE,
+                            levels = c("0","1","2","3"),
+                            labels = c("0yrs","10yrs","20yrs","30yrs"))
+
+marriage$Freq <- as.numeric(marriage$Freq)
+```
+
+```{r marriage4, echo = FALSE}
+ggplot(marriage, aes(x = MARRIAGE, y = Freq, fill = MARRIAGE)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("darkgrey","navyblue","navyblue","navyblue")) +
+  coord_flip() +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  guides(fill = FALSE) +
+  geom_text(aes(label=round(Freq,0), size=1, hjust=-0.3, vjust=-0.5)) +
+  theme(legend.position='none') +
+  labs(title = 'Long Term Marriages More Likely to Default = Deceiving Chart',
+       subtitle = 'Not a fair representation because 99% of our customers are in long term marriages',
+       caption = 'Would be interesting to explore further and see why this is, e.g. divorce or increased costs with children?',
+       x='Marriage',
+       y = 'Percentage')
+```
+
+We can see the data is concentrated in just a couple of the marriage levels and the default percentages of most of these are very similar. So I don't think this feature will be much help in the modelling stage.
+
+If we take a quick look at the education variable, we can see there's a correlation with increasing default among less educated.
+
+```{r education}
+dataset %>% 
+  group_by(EDUCATION,DEFAULT) %>% 
+  summarise(Count = n()) %>% 
+  mutate(Ratio = Count / sum(Count)) %>% 
+  kable()
+```
+
+We'll also quickly see how correlated the varaibles are to each other using a correlation plot. 
+
+It's evident the bill amounts are extremely highly correlated. It would often be a good idea to use PCA to combine all of these and create a new variable, however in this case I'm not going to do this, as I still want to explore the features further on their own later and PCA will make them harder to interpret.
+
+```{r corr, echo = FALSE}
+M <- cor(select(dataset, AGE:PAY_AMT6))
+diag(M) <- 0
+corrplot(M, method="square") 
+```
+
+
+## Splitting The Dataset
+
+Now we're going to prepare our data for modelling and the first stage is to split our dataset - 70% training, 15% validating and 15% testing.
+
+```{r splitting}
+inTrain <- createDataPartition(y = dataset$DEFAULT,
+                               p = 0.7, list = FALSE)
+
+training <- dataset[inTrain,]
+
+testval <- dataset[-inTrain,]
+
+inTest <- createDataPartition(y = testval$DEFAULT,
+                              p = 0.5, list = FALSE)
+
+testing <- testval[inTest,]
+validating <- testval[-inTest,]
+```
+
+## Pre-Processing
+
+It's necessary that we prepare the data in the best way for the models to interpret.
+
+Firstly, if we focus on the LIMIT_BAL variable, it's evident that taking a logarithm value will make it slightly more correlated to the Default outcome.
+
+```{r loglimit, echo = FALSE}
+dataset %>%
+  select(DEFAULT, LIMIT_BAL) %>%
+  mutate(
+    DEFAULT = DEFAULT %>% as.factor() %>% as.numeric(),
+    LogTotalCharges = log(LIMIT_BAL)
+  ) %>%
+  correlate() %>%
+  focus(DEFAULT) %>%
+  fashion()
+```
+
+So we'll take the logarithm value of the above feature, create dummy variables for all categorical features then center and scale all features, and apply these to all our datasets.
+
+```{r recipe}
+rec_obj <- recipe(DEFAULT ~ ., data = training) %>% 
+  step_log(LIMIT_BAL) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_center(all_predictors(), -all_outcomes()) %>% 
+  step_scale(all_predictors(), -all_outcomes()) %>%
+  prep(data = training)
+
+trainingObj <- bake(rec_obj, newdata = training)
+testingObj <- bake(rec_obj, newdata = testing)
+validatingObj <- bake(rec_obj, newdata = validating)
+```
+
+## xgBoost Modelling
+
+```{r xgboost1}
+xgbModFit <- xgboost(data = data.matrix(trainingObj[,-1]),
+                     label = trainingObj$DEFAULT,
+                     nrounds = 25)
+```
+
+We can then analyse the most important variables for this model which is great for shedding further light on our dataset. For example, we can see Pay 0 is hugely important, this is their last months repayment status (Sept) so it makes sense this would be the most telling variable.
+
+```{r xgboost2}
+importancematrix <- xgb.importance(feature_names = colnames(trainingObj[,-1]), model = xgbModFit)
+
+xgb.plot.importance(importancematrix)
+```
+
+We can also look more at this variable in the original training dataset (before we one hot encoded factor variables).
+
+This will help explain why this variable is so important, we can see that once you start being late on repayments in the last month September (values above 0) then the likelihood of your next repayment being late becomes exponentially higher.
+
+```{r pay0}
+xgpay0 <-
+  training %>% 
+  group_by(PAY_0 = as.numeric(as.character(PAY_0)), DEFAULT ) %>% 
+  summarise(Count = n()) %>% 
+  mutate(Freq = as.numeric(formatC(100*(Count / sum(Count)), digits = 2, format = "f"))) %>% 
+  arrange(desc(DEFAULT),desc(Freq)) %>% 
+  filter(DEFAULT == 1)
+
+totalpop <- sum(xgpay0$Count)
+
+xgpay0 <-
+  xgpay0 %>% 
+  mutate(TotalPopulation = formatC(100 * (Count / totalpop), digits = 2, format = "f"))
+
+kable(xgpay0,"html") %>% 
+  kable_styling("striped",full_width=F) 
+```
+
+```{r pay02, echo=FALSE}
+ggplot(data = xgpay0, aes(x = PAY_0, y = Freq)) +
+  geom_line(size = 1.3, colour = "navyblue") +
+  geom_point(data = filter(xgpay0, Freq > 50), size = 2, colour = "red") +
+  geom_hline(yintercept = 50, colour = "red", linetype = "dotted", size = 0.9) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = 50, ymax = 100), fill = "firebrick", alpha = 0.005) +
+  annotate("text", size = 3.5, x = 3.9, y = 37, colour = "#666666", label = "Concerning as just over 30% of the customers \n were 2 or more months overdue in Sept.") +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        panel.grid = element_blank(),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_x_continuous(breaks = seq(-2,8,1)) +
+  scale_y_continuous(breaks = seq(0,100,25)) +
+  coord_cartesian(ylim = c(0,100)) +
+  labs(title = 'Overdue Repayments Increase Likelihood of Default',
+       subtitle = 'Over 2 months and your likelihood is more than 50%',
+       x = "Months Overdue on Sept", 
+       y = "Default Next Payment %",
+       caption = '
+Note: Small numbers on later months which probably explains the eratic percentage swings.')
+```
+
+One of the other important factors was Bill_Amt 1 which also refers to the size of the bill in September. Again I'll use the original training dataset before I scaled the continuous values.
+
+Can't see any super strong correlation here though.
+
+```{r bill1, echo=FALSE}
+ggplot(data = training, aes(x = DEFAULT, y = BILL_AMT1)) +
+  geom_violin(aes(fill = DEFAULT), alpha = 0.8) +
+  geom_boxplot(width = 0.13, fill = "white", alpha = 0.5) +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  coord_cartesian(ylim = c(0, 200000)) +
+  scale_fill_tableau() +
+  guides(fill = FALSE) +
+  scale_y_continuous(labels=comma) +
+  labs(title = 'No Strong Correlation Between Bill Amount & Default',
+       x = 'Default (No - Yes)',
+       y = 'Sept Bill Amount')
+```
+
+Try plotting this with age, again a slight correlation with those with higher bills defaulting being younger, but not as strong as I would've expected.
+
+```{r bill2, echo=FALSE}
+ggplot(data = training, aes(x = AGE, y = BILL_AMT1, colour = DEFAULT)) +
+  geom_point(position = "jitter") +
+  geom_smooth() +
+  scale_color_tableau() +
+  theme_tq() +
+  theme(panel.border = element_blank(),
+        plot.title = element_text(colour = "#666666", size = 12, face = "bold"),
+        plot.subtitle = element_text(colour = "#666666", size = 10),
+        axis.title = element_text(colour = "#666666"),
+        axis.title.x = element_text(hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.text = element_text(colour = "#666666"),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        plot.caption = element_text(colour = "darkgrey", hjust = 0, size = 8),
+        legend.position = "top",
+        legend.justification = 0) +
+  scale_y_continuous(labels=comma) +
+  coord_cartesian(ylim = c(0,600000)) +
+  labs(title = 'Older Customers Slightly Less Likely to Default on Higher Bills',
+       x = 'Age',
+       y = 'Sept Bill Amount')
+```
+
+Anyway there's a lot more exploring we could do but this should demonstrate the idea of exploring in conjunction with the importance plots from our model.
+
+Now we'll get back to our xg boost model to make some predictions on the test set. The model's accuracy is fairly low, it's predicting a decent number of the default outcomes correctly but is getting a lot wrong too.
+
+```{r xgboost3}
+xgbpred <- predict(xgbModFit, data.matrix(testingObj[,-1]))
+xgbpred <- ifelse(xgbpred > 1.5, 1, 0)
+
+testingxgb <- as.numeric(as.character(testingObj$DEFAULT))
+
+confusionMatrix(xgbpred, testingxgb)
+```
+
+```{r xgboost4, echo = FALSE}
+plot(performance(prediction(xgbpred, testingxgb), measure = 'tpr', x.measure = 'fpr'), col = 2, lwd = 2, main = "XGB ROC Curve")
+abline(a=0, b= 1, lty = 5, col = 4)
+abline(v = 0.5, lty = 3)
+abline(h = 0.7, lty = 3)
+abline(h = 0.9, lty = 3)
+```
+
+
+## H2o Modelling
+
+We'll use the auto_ml function which will take care of grid search and running numerous iterations of models to keep the best version.
+
+This basically performs all computations in highly optimized Java code in the H2o cluster, intiated by REST calls from R.
+
+First we convert the data into H2o frames and prepare the auto_ml specifying a maximum time to run, in this instance 1 minute.
+
+```{r h2o1}
+h2o.init()
+h2o.no_progress()
+
+train_h2o <- as.h2o(trainingObj)
+valid_h2o <- as.h2o(validatingObj)
+test_h2o <- as.h2o(testingObj)
+
+y = "DEFAULT"
+x = setdiff(names(train_h2o),y)
+
+automl_models_h2o <- h2o.automl(
+  x = x,
+  y = y,
+  training_frame = train_h2o,
+  leaderboard_frame = valid_h2o,
+  max_runtime_secs = 60
+)
+automl_models_h2o@leaderboard
+```
+
+The leading model is a Stack Ensemble model, which means it's a combination of multiple machine learning models.
+
+Now we'll move on to making predictions on the test set, evaluating with a confusion matrix and analysing further with accuracy measures.
+
+```{r h2o2}
+model <- automl_models_h2o@leader
+
+pred_h2o <- h2o.predict(object = model, newdata = test_h2o)
+
+test_performance <- test_h2o %>%
+  tibble::as_tibble() %>%
+  select(DEFAULT) %>%
+  add_column(pred = as.vector(pred_h2o$predict)) %>%
+  mutate_if(is.character, as.factor)
+
+confusion_matrix <- test_performance %>%
+  table() 
+confusion_matrix
+
+tn <- confusion_matrix[1]
+tp <- confusion_matrix[4]
+fp <- confusion_matrix[3]
+fn <- confusion_matrix[2]
+accuracy <- (tp + tn) / (tp + tn + fp + fn)
+misclassification_rate <- 1 - accuracy
+recall <- tp / (tp + fn)
+precision <- tp / (tp + fp)
+null_error_rate <- tn / (tp + tn + fp + fn)
+tibble(
+  accuracy,
+  misclassification_rate,
+  recall,
+  precision,
+  null_error_rate
+) %>% 
+  transpose()
+```
+
+Then we'll manipulate the data into the appropriate format and plot an ROC curve to further evaluate this model.
+
+```{r h2o3}
+predicteval <- as.data.frame(pred_h2o)
+testingeval <- as.data.frame(testingObj)
+
+predicteval$predict <- as.numeric(predicteval$predict)
+testingeval$DEFAULT <- as.numeric(testingeval$DEFAULT)
+```
+
+```{r h2o4, echo=FALSE}
+plot(performance(prediction(predicteval$predict, testingeval$DEFAULT), measure = 'tpr', x.measure = 'fpr'), col = 2, lwd = 2, main = "H2O ROC Curve")
+abline(a=0, b= 1, lty = 5, col = 4)
+abline(v = 0.5, lty = 3)
+abline(h = 0.7, lty = 3)
+abline(h = 0.9, lty = 3)
+```
+
+
+# Boosted Generalized Linear Model
+
+Just to cover all bases, rather than using a boosted tree model we'll try a more linear approach. This model will struggle with all the dummy variables I've setup for the categorical variables though because some of the classes are only a few observations. As such, I'm going to use our original split datasets prior to the pre-processing / feature engineering.
+
+```{r glm1}
+glmFit <- train(DEFAULT ~ .,
+                data = training,
+                method = "glmboost")
+
+glmpred <- predict(glmFit, newdata = testing)
+
+confusionMatrix(glmpred, testing$DEFAULT)
+
+glmpredrocr <- as.numeric(as.character(glmpred))
+glmtestrocr <- as.numeric(as.character(testing$DEFAULT))
+
+plot(performance(prediction(glmpredrocr, glmtestrocr), measure = 'tpr', x.measure = 'fpr'), col = 2, lwd = 2, main = "GLM ROC Curve")
+abline(a=0, b= 1, lty = 5, col = 4)
+abline(v = 0.5, lty = 3)
+abline(h = 0.7, lty = 3)
+abline(h = 0.9, lty = 3)
+```
+
+The model actually has quite a high level of accuracy, but despite this the accuracy in predicting the Default outcome is lower at 34% so we won't want to use this model.
+
+Also worth noting, I tried the model after centering and scaling the training dataset, but this actually made the linear model less accurate.
+
+
+## Final Thoughts
+
+We now understand a lot more about the data and our customers who are defaulting on their payments. All things considered, I think we'll stick with our H2o model as this was fairly accurate and was the best at predicting those who will default which is our biggest concern here.
